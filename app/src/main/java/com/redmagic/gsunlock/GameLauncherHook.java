@@ -248,6 +248,22 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "showGameStrengthenModeView(" + pkg + ") вызван, args=" + pt.length);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "showPanel failed: " + t);
+            // распаковываем InvocationTargetException -> печатаем настоящую причину + стек
+            Throwable c = t;
+            while (c instanceof java.lang.reflect.InvocationTargetException && c.getCause() != null) {
+                c = c.getCause();
+            }
+            XposedBridge.log(TAG + "  ROOT CAUSE: " + c);
+            for (StackTraceElement e : c.getStackTrace()) {
+                XposedBridge.log(TAG + "    at " + e);
+            }
+            Throwable cz = c.getCause();
+            if (cz != null) {
+                XposedBridge.log(TAG + "  Caused by: " + cz);
+                for (StackTraceElement e : cz.getStackTrace()) {
+                    XposedBridge.log(TAG + "    at " + e);
+                }
+            }
         }
     }
 
