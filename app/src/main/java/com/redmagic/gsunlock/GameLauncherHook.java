@@ -10,8 +10,16 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
 
+import android.view.View;
+import android.view.ViewGroup;
+
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -52,10 +60,14 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
     public static final String ACTION_HIDE = "com.redmagic.gsunlock.HIDE_PANEL";
     private static final String ACTION_NATIVE_CLOSE =
             "cn.nubia.gamelauncher.action.close_controlpanel";
+    // Живой командный канал: модуль грузится раз, дальше всё через broadcast без пересборки.
+    public static final String ACTION_CMD = "com.redmagic.gsunlock.CMD";
 
     private static boolean sReceiverRegistered = false;
     private static Object sCtrl = null;
     private ClassLoader mCl;
+    // храним живые хуки по ключу "cls#method", чтобы снимать через CMD unhook
+    private static final Map<String, Set<XC_MethodHook.Unhook>> sHooks = new HashMap<>();
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
@@ -150,6 +162,21 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "isW210DS hook failed: " + t);
         }
 
+        // (1e) MindSync отсутствует на линейке: CustomPerfProfileManager.getApplyProfile()
+        // внутри трогает com.zte.performance.mindsync.MindSyncManager$Trigger ->
+        // NoClassDefFoundError, и это валит процесс при perModeChange (вызов до
+        // проверки mode==4). Возвращаем null — тело с MindSync не выполняется,
+        // а perModeChange использует результат только в логе.
+        try {
+            Class<?> ppm = XposedHelpers.findClass(
+                    "cn.nubia.gamelauncher.gamecontrolpanel.performancetuning.CustomPerfProfileManager", mCl);
+            int np = XposedBridge.hookAllMethods(ppm, "getApplyProfile",
+                    XC_MethodReplacement.returnConstant(null)).size();
+            XposedBridge.log(TAG + "getApplyProfile force=null (MindSync обойдён), hooks=" + np);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "getApplyProfile hook failed: " + t);
+        }
+
         // (2) регистрируем ресивер показа панели как только появится контекст
         try {
             XposedHelpers.findAndHookMethod(Application.class, "onCreate",
@@ -194,6 +221,10 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
                     main.post(new Runnable() {
                         @Override public void run() { hidePanel(appCtx); }
                     });
+                } else if (ACTION_CMD.equals(action)) {
+                    main.post(new Runnable() {
+                        @Override public void run() { handleCmd(appCtx, intent); }
+                    });
                 }
             }
         };
@@ -201,6 +232,7 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
         IntentFilter f = new IntentFilter();
         f.addAction(ACTION_SHOW);
         f.addAction(ACTION_HIDE);
+        f.addAction(ACTION_CMD);
         try {
             // RECEIVER_EXPORTED = 2 (нужно, т.к. шлём из shell/другого uid; Android 13+)
             appCtx.registerReceiver(r, f, 2);
@@ -302,6 +334,143 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "послан " + ACTION_NATIVE_CLOSE);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "hidePanel failed: " + t);
+        }
+    }
+
+    // ==================== ЖИВОЙ КОМАНДНЫЙ КАНАЛ ====================
+    // am broadcast -a com.redmagic.gsunlock.CMD -p cn.nubia.gamelauncher --es op <OP> ...
+    //  hook    --es cls FQCN --es m method [--es ret <typed>]   поставить returnConstant-хук
+    //  unhook  --es key cls#method                              снять хук
+    //  istatic --es cls FQCN --es m method [--es a0..a5 <typed>] вызвать static-метод
+    //  icall   --es m method [--es a0..a5 <typed>]              вызвать метод на контроллере (sCtrl)
+    //  sget    --es cls FQCN --es f field                       прочитать static-поле
+    //  sset    --es cls FQCN --es f field --es v <typed>        записать static-поле
+    //  set     --es scope <global|system|secure> --es key K --es v V   записать Settings
+    //  dump    [--es filter substr]                             дамп дерева View всех окон
+    // typed: s:STR | i:N | l:N | f:N | b:true | null | (без префикса = строка)
+    private void handleCmd(final Context ctx, final Intent it) {
+        final String op = it.getStringExtra("op");
+        if (op == null) { XposedBridge.log(TAG + "CMD: нет op"); return; }
+        try {
+            if ("hook".equals(op)) {
+                String cls = it.getStringExtra("cls");
+                String m = it.getStringExtra("m");
+                Object ret = coerce(it.getStringExtra("ret"));
+                Class<?> c = XposedHelpers.findClass(cls, mCl);
+                Set<XC_MethodHook.Unhook> set =
+                        XposedBridge.hookAllMethods(c, m, XC_MethodReplacement.returnConstant(ret));
+                sHooks.put(cls + "#" + m, set);
+                XposedBridge.log(TAG + "CMD hook " + cls + "#" + m + " -> " + ret + " (" + set.size() + ")");
+            } else if ("unhook".equals(op)) {
+                String key = it.getStringExtra("key");
+                Set<XC_MethodHook.Unhook> set = sHooks.remove(key);
+                int n = 0;
+                if (set != null) { for (XC_MethodHook.Unhook u : set) { u.unhook(); n++; } }
+                XposedBridge.log(TAG + "CMD unhook " + key + " (" + n + ")");
+            } else if ("istatic".equals(op)) {
+                Class<?> c = XposedHelpers.findClass(it.getStringExtra("cls"), mCl);
+                Object r = XposedHelpers.callStaticMethod(c, it.getStringExtra("m"), readArgs(it));
+                XposedBridge.log(TAG + "CMD istatic " + it.getStringExtra("m") + " = " + r);
+            } else if ("icall".equals(op)) {
+                Object target = (sCtrl != null) ? sCtrl : getCtrl(ctx);
+                if (target == null) { XposedBridge.log(TAG + "CMD icall: нет ctrl"); return; }
+                Object r = XposedHelpers.callMethod(target, it.getStringExtra("m"), readArgs(it));
+                XposedBridge.log(TAG + "CMD icall " + it.getStringExtra("m") + " = " + r);
+            } else if ("sget".equals(op)) {
+                Class<?> c = XposedHelpers.findClass(it.getStringExtra("cls"), mCl);
+                Object r = XposedHelpers.getStaticObjectField(c, it.getStringExtra("f"));
+                XposedBridge.log(TAG + "CMD sget " + it.getStringExtra("f") + " = " + r);
+            } else if ("sset".equals(op)) {
+                Class<?> c = XposedHelpers.findClass(it.getStringExtra("cls"), mCl);
+                XposedHelpers.setStaticObjectField(c, it.getStringExtra("f"), coerce(it.getStringExtra("v")));
+                XposedBridge.log(TAG + "CMD sset " + it.getStringExtra("f") + " <- " + it.getStringExtra("v"));
+            } else if ("set".equals(op)) {
+                String scope = it.getStringExtra("scope");
+                String key = it.getStringExtra("key");
+                String v = it.getStringExtra("v");
+                if ("system".equals(scope)) Settings.System.putString(ctx.getContentResolver(), key, v);
+                else if ("secure".equals(scope)) Settings.Secure.putString(ctx.getContentResolver(), key, v);
+                else Settings.Global.putString(ctx.getContentResolver(), key, v);
+                XposedBridge.log(TAG + "CMD set " + scope + " " + key + " = " + v);
+            } else if ("dump".equals(op)) {
+                dumpAllViews(it.getStringExtra("filter"));
+            } else {
+                XposedBridge.log(TAG + "CMD: неизвестный op=" + op);
+            }
+        } catch (Throwable t) {
+            Throwable cse = t;
+            while (cse instanceof java.lang.reflect.InvocationTargetException && cse.getCause() != null) cse = cse.getCause();
+            XposedBridge.log(TAG + "CMD " + op + " FAILED: " + cse);
+        }
+    }
+
+    private Object[] readArgs(Intent it) {
+        List<Object> a = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            String raw = it.getStringExtra("a" + i);
+            if (raw == null) break;
+            a.add(coerce(raw));
+        }
+        return a.toArray();
+    }
+
+    private Object coerce(String raw) {
+        if (raw == null || "null".equals(raw)) return null;
+        if (raw.startsWith("s:")) return raw.substring(2);
+        if (raw.startsWith("i:")) return Integer.valueOf(Integer.parseInt(raw.substring(2)));
+        if (raw.startsWith("l:")) return Long.valueOf(Long.parseLong(raw.substring(2)));
+        if (raw.startsWith("f:")) return Float.valueOf(Float.parseFloat(raw.substring(2)));
+        if (raw.startsWith("b:")) return Boolean.valueOf("true".equalsIgnoreCase(raw.substring(2)));
+        if ("true".equals(raw)) return Boolean.TRUE;
+        if ("false".equals(raw)) return Boolean.FALSE;
+        return raw;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void dumpAllViews(String filter) {
+        try {
+            Class<?> wmg = XposedHelpers.findClass("android.view.WindowManagerGlobal", mCl);
+            Object inst = XposedHelpers.callStaticMethod(wmg, "getInstance");
+            Object viewsObj = XposedHelpers.getObjectField(inst, "mViews");
+            List<View> views = new ArrayList<>();
+            if (viewsObj instanceof List) {
+                for (Object o : (List<Object>) viewsObj) views.add((View) o);
+            } else if (viewsObj instanceof View[]) {
+                for (View o : (View[]) viewsObj) views.add(o);
+            }
+            XposedBridge.log(TAG + "DUMP: окон=" + views.size() + (filter != null ? " filter=" + filter : ""));
+            for (View root : views) {
+                XposedBridge.log(TAG + "== root " + root.getClass().getName()
+                        + " " + root.getWidth() + "x" + root.getHeight() + " ==");
+                dumpViewTree(root, 0, filter);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "dump failed: " + t);
+        }
+    }
+
+    private void dumpViewTree(View v, int depth, String filter) {
+        if (v == null || depth > 12) return;
+        String id = "";
+        try {
+            if (v.getId() != View.NO_ID) id = v.getResources().getResourceEntryName(v.getId());
+        } catch (Throwable ignored) {}
+        String vis = v.getVisibility() == View.VISIBLE ? "VIS"
+                : (v.getVisibility() == View.GONE ? "GONE" : "INV");
+        String line = v.getClass().getSimpleName() + " id=" + id + " " + vis
+                + " " + v.getWidth() + "x" + v.getHeight()
+                + " @" + ((int) v.getX()) + "," + ((int) v.getY());
+        boolean show = filter == null
+                || v.getClass().getName().toLowerCase().contains(filter.toLowerCase())
+                || id.toLowerCase().contains(filter.toLowerCase());
+        if (show) {
+            StringBuilder pad = new StringBuilder();
+            for (int i = 0; i < depth; i++) pad.append("  ");
+            XposedBridge.log(TAG + "  " + pad + line);
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) dumpViewTree(g.getChildAt(i), depth + 1, filter);
         }
     }
 }
