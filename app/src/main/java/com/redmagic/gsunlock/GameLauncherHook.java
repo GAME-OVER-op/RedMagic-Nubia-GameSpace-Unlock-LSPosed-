@@ -119,6 +119,20 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "FeatureUtil hook failed: " + t);
         }
 
+        // (1c) Utils.isSupportFan() зовёт getPackageInfo("cn.nubia.fan") и НЕ ловит
+        // NameNotFoundException -> на линейке (пакета нет) это валит
+        // showGameStrengthenModeView -> InvocationTargetException -> панель не строится.
+        // Кулер рулится отдельно (kernel-узел), поэтому говорим "вентилятор не поддерживается".
+        try {
+            Class<?> utils = XposedHelpers.findClass(
+                    "cn.nubia.gamelauncher.gamecontrolpanel.utils.Utils", mCl);
+            int n = XposedBridge.hookAllMethods(utils, "isSupportFan",
+                    XC_MethodReplacement.returnConstant(Boolean.FALSE)).size();
+            XposedBridge.log(TAG + "isSupportFan force=false, hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "isSupportFan hook failed: " + t);
+        }
+
         // (2) регистрируем ресивер показа панели как только появится контекст
         try {
             XposedHelpers.findAndHookMethod(Application.class, "onCreate",
