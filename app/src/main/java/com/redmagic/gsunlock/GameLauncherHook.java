@@ -94,7 +94,7 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
         // На стоке исключение глушится; тут оно пробивает <clinit> FunctionAllocationHelper
         // (в статике вызываются getZteFeature*) -> ExceptionInInitializerError -> панель
         // не строится (showGameStrengthenModeView кидает InvocationTargetException).
-        // Перехватываем ВСЕ методы FeatureUtil: НЕ зовём forName, возвращаем дефолт
+        // Перехватываем ВСЕ методы FeatureUtil: НЕ зов��м forName, возвращаем дефолт
         // (второй аргумент), а нужные фичи форсим. Чинит показ панели + включает
         // боковые перф-карточки частот ЦП/ГП (ключ *ZPERF_CUBE_GPSETTING*).
         try {
@@ -347,6 +347,9 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
     //  sset    --es cls FQCN --es f field --es v <typed>        записать static-поле
     //  set     --es scope <global|system|secure> --es key K --es v V   записать Settings
     //  dump    [--es filter substr]                             дамп дерева View всех окон
+    //  vop     --es do <vis|bg|bgnull|alpha|tx|ty|w|h|invoke> --es v VAL [--es find idName] [--es mclass ClassSimpleName]
+    //          операция над View (по id или по имени класса), применяется ко всем совпавшим
+    //          vis: visible|gone|invisible ; bg: ARGB hex (0=прозрачный) ; alpha/tx/ty: float ; w/h: px ; invoke: имя no-arg метода
     // typed: s:STR | i:N | l:N | f:N | b:true | null | (без префикса = строка)
     private void handleCmd(final Context ctx, final Intent it) {
         final String op = it.getStringExtra("op");
@@ -394,6 +397,9 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + "CMD set " + scope + " " + key + " = " + v);
             } else if ("dump".equals(op)) {
                 dumpAllViews(it.getStringExtra("filter"));
+            } else if ("vop".equals(op)) {
+                applyVop(it.getStringExtra("find"), it.getStringExtra("mclass"),
+                        it.getStringExtra("do"), it.getStringExtra("v"));
             } else {
                 XposedBridge.log(TAG + "CMD: неизвестный op=" + op);
             }
@@ -472,5 +478,76 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) dumpViewTree(g.getChildAt(i), depth + 1, filter);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<View> allRoots() {
+        List<View> views = new ArrayList<>();
+        try {
+            Class<?> wmg = XposedHelpers.findClass("android.view.WindowManagerGlobal", mCl);
+            Object inst = XposedHelpers.callStaticMethod(wmg, "getInstance");
+            Object viewsObj = XposedHelpers.getObjectField(inst, "mViews");
+            if (viewsObj instanceof List) { for (Object o : (List<Object>) viewsObj) views.add((View) o); }
+            else if (viewsObj instanceof View[]) { for (View o : (View[]) viewsObj) views.add(o); }
+        } catch (Throwable t) { XposedBridge.log(TAG + "allRoots failed: " + t); }
+        return views;
+    }
+
+    private void collect(View v, String idName, String className, List<View> out) {
+        if (v == null) return;
+        boolean m = false;
+        if (idName != null) {
+            try {
+                if (v.getId() != View.NO_ID
+                        && idName.equalsIgnoreCase(v.getResources().getResourceEntryName(v.getId()))) m = true;
+            } catch (Throwable ignored) {}
+        }
+        if (!m && className != null && v.getClass().getSimpleName().equalsIgnoreCase(className)) m = true;
+        if (m) out.add(v);
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collect(g.getChildAt(i), idName, className, out);
+        }
+    }
+
+    private void applyVop(String idName, String className, String act, String val) {
+        if (act == null) { XposedBridge.log(TAG + "vop: нет do"); return; }
+        if (idName == null && className == null) { XposedBridge.log(TAG + "vop: нужен find или mclass"); return; }
+        List<View> targets = new ArrayList<>();
+        for (View root : allRoots()) collect(root, idName, className, targets);
+        int n = 0;
+        for (View v : targets) {
+            try {
+                if ("vis".equals(act)) {
+                    int vis = "gone".equalsIgnoreCase(val) ? View.GONE
+                            : ("invisible".equalsIgnoreCase(val) ? View.INVISIBLE : View.VISIBLE);
+                    v.setVisibility(vis);
+                } else if ("bg".equals(act)) {
+                    v.setBackgroundColor((int) Long.parseLong(val.replace("#", ""), 16));
+                } else if ("bgnull".equals(act)) {
+                    v.setBackground(null);
+                } else if ("alpha".equals(act)) {
+                    v.setAlpha(Float.parseFloat(val));
+                } else if ("tx".equals(act)) {
+                    v.setTranslationX(Float.parseFloat(val));
+                } else if ("ty".equals(act)) {
+                    v.setTranslationY(Float.parseFloat(val));
+                } else if ("w".equals(act) || "h".equals(act)) {
+                    android.view.ViewGroup.LayoutParams lp = v.getLayoutParams();
+                    int px = Integer.parseInt(val);
+                    if ("w".equals(act)) lp.width = px; else lp.height = px;
+                    v.setLayoutParams(lp);
+                } else if ("invoke".equals(act)) {
+                    XposedHelpers.callMethod(v, val);
+                } else {
+                    XposedBridge.log(TAG + "vop: неизвестный do=" + act); return;
+                }
+                n++;
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + "vop на " + v.getClass().getSimpleName() + " failed: " + t);
+            }
+        }
+        XposedBridge.log(TAG + "vop do=" + act + " v=" + val
+                + " find=" + idName + " mclass=" + className + " -> применено к " + n);
     }
 }
