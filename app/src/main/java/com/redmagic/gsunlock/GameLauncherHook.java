@@ -77,6 +77,22 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "input-monitor hook failed: " + t);
         }
 
+        // (1b) ВКЛЮЧИТЬ боковые перф-карточки (частота ЦП/ГП по краям).
+        // showGameStrengthenModeView зовёт setShowCustomPerfWindow(1) только если
+        // ControlPanelFeatureHelper.getZteFeatureZperfCubeGpsettingEnabled()==true.
+        // На Lineage эта фича читается из отсутствующего com.zte.feature.Feature и
+        // даёт false -> карточек нет. Форсим true.
+        try {
+            Class<?> helper = XposedHelpers.findClass(
+                    "cn.nubia.gamelauncher.gamecontrolpanel.utils.ControlPanelFeatureHelper", mCl);
+            int n = XposedBridge.hookAllMethods(helper,
+                    "getZteFeatureZperfCubeGpsettingEnabled",
+                    XC_MethodReplacement.returnConstant(Boolean.TRUE)).size();
+            XposedBridge.log(TAG + "ZperfCubeGpsetting force=true, hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "ZperfCube hook failed: " + t);
+        }
+
         // (2) регистрируем ресивер показа панели как только появится контекст
         try {
             XposedHelpers.findAndHookMethod(Application.class, "onCreate",
