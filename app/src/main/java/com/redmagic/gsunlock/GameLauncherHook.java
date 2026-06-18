@@ -133,6 +133,23 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "isSupportFan hook failed: " + t);
         }
 
+        // (1d) РАСКЛАДКА: боковые карточки vs нижняя полоса.
+        // GameControlDialog.initView() и adjustZteRotation() включают широкую
+        // landscape-раскладку (addOnLayoutChangeListener + форс orientation=landscape
+        // + ресайз rootView) ТОЛЬКО когда Utils.isW210DS()==true. Этот метод читает
+        // SystemProperties.get("ro.product.name").contains("W210DS"). На NX769J это
+        // false -> панель сваливается в дефолтную (компактную нижнюю) раскладку.
+        // Форсим true -> панель раскладывается боковыми карточками по краям экрана.
+        try {
+            Class<?> utilsW = XposedHelpers.findClass(
+                    "cn.nubia.gamelauncher.gamecontrolpanel.utils.Utils", mCl);
+            int nw = XposedBridge.hookAllMethods(utilsW, "isW210DS",
+                    XC_MethodReplacement.returnConstant(Boolean.TRUE)).size();
+            XposedBridge.log(TAG + "isW210DS force=true (боковая раскладка), hooks=" + nw);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "isW210DS hook failed: " + t);
+        }
+
         // (2) регистрируем ресивер показа панели как только появится контекст
         try {
             XposedHelpers.findAndHookMethod(Application.class, "onCreate",
