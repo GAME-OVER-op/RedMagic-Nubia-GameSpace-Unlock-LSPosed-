@@ -77,20 +77,46 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "input-monitor hook failed: " + t);
         }
 
-        // (1b) ВКЛЮЧИТЬ боковые перф-карточки (частота ЦП/ГП по краям).
-        // showGameStrengthenModeView зовёт setShowCustomPerfWindow(1) только если
-        // ControlPanelFeatureHelper.getZteFeatureZperfCubeGpsettingEnabled()==true.
-        // На Lineage эта фича читается из отсутствующего com.zte.feature.Feature и
-        // даёт false -> карточек нет. Форсим true.
+        // (1b) КОРЕНЬ ВСЕХ КРАШЕЙ: cn.nubia.common.util.FeatureUtil.get*(...)
+        // делает Class.forName("com.zte.feature.Feature"), которого нет на Lineage.
+        // На стоке исключение глушится; тут оно пробивает <clinit> FunctionAllocationHelper
+        // (в статике вызываются getZteFeature*) -> ExceptionInInitializerError -> панель
+        // не строится (showGameStrengthenModeView кидает InvocationTargetException).
+        // Перехватываем ВСЕ методы FeatureUtil: НЕ зовём forName, возвращаем дефолт
+        // (второй аргумент), а нужные фичи форсим. Чинит показ панели + включает
+        // боковые перф-карточки частот ЦП/ГП (ключ *ZPERF_CUBE_GPSETTING*).
         try {
-            Class<?> helper = XposedHelpers.findClass(
-                    "cn.nubia.gamelauncher.gamecontrolpanel.utils.ControlPanelFeatureHelper", mCl);
-            int n = XposedBridge.hookAllMethods(helper,
-                    "getZteFeatureZperfCubeGpsettingEnabled",
-                    XC_MethodReplacement.returnConstant(Boolean.TRUE)).size();
-            XposedBridge.log(TAG + "ZperfCubeGpsetting force=true, hooks=" + n);
+            Class<?> fu = XposedHelpers.findClass("cn.nubia.common.util.FeatureUtil", mCl);
+
+            XposedBridge.hookAllMethods(fu, "getBoolean", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    String key = (p.args.length > 0 && p.args[0] != null) ? p.args[0].toString() : "";
+                    boolean def = (p.args.length > 1 && p.args[1] instanceof Boolean)
+                            ? ((Boolean) p.args[1]).booleanValue() : false;
+                    boolean res = def;
+                    if (key.contains("ZPERF_CUBE_GPSETTING")) res = true; // перф-карточки ЦП/ГП
+                    p.setResult(Boolean.valueOf(res));
+                }
+            });
+
+            XposedBridge.hookAllMethods(fu, "getInt", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    int def = (p.args.length > 1 && p.args[1] instanceof Integer)
+                            ? ((Integer) p.args[1]).intValue() : 0;
+                    p.setResult(Integer.valueOf(def));
+                }
+            });
+
+            for (String mn : new String[]{"get", "getString"}) {
+                XposedBridge.hookAllMethods(fu, mn, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        p.setResult(p.args.length > 1 ? p.args[1] : null);
+                    }
+                });
+            }
+            XposedBridge.log(TAG + "FeatureUtil нейтрализован (без forName), ZperfCube=true");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "ZperfCube hook failed: " + t);
+            XposedBridge.log(TAG + "FeatureUtil hook failed: " + t);
         }
 
         // (2) регистрируем ресивер показа панели как только появится контекст
