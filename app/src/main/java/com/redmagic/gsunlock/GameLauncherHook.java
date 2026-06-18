@@ -224,6 +224,17 @@ public class GameLauncherHook implements IXposedHookLoadPackage {
         try {
             Object ctrl = getCtrl(ctx);
             if (ctrl == null) return;
+            // in-panel секция "custom performance" зависит от ZTE MindSyncManager (нет на линейке):
+            // без этого getApplyProfile() бросает NoClassDefFoundError и валит всю панель.
+            // Гейт SUPPORT_CUSTOM_PERFORMANCE_MODE=false -> блок initCustomPerf пропускается.
+            try {
+                Class<?> gspv = XposedHelpers.findClass(
+                    "cn.nubia.gamelauncher.gamecontrolpanel.GameStrengthenPerformanceView", mCl);
+                XposedHelpers.setStaticObjectField(gspv, "SUPPORT_CUSTOM_PERFORMANCE_MODE", Boolean.FALSE);
+                XposedBridge.log(TAG + "SUPPORT_CUSTOM_PERFORMANCE_MODE=false (MindSync недоступен)");
+            } catch (Throwable tt) {
+                XposedBridge.log(TAG + "setSupportCustomPerf failed: " + tt);
+            }
             Method show = null;
             for (Method m : ctrl.getClass().getDeclaredMethods()) {
                 if (m.getName().equals("showGameStrengthenModeView")) { show = m; break; }
