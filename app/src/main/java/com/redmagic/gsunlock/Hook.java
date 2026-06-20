@@ -1,6 +1,5 @@
 package com.redmagic.gsunlock;
 
-import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -298,55 +297,58 @@ public class Hook implements IXposedHookLoadPackage {
      * включён, остальные RM-фичи выкл). Доп. страховка — хук ClassLoader.loadClass.
      */
     private void injectFeatureStub(ClassLoader appCl) {
-        // Класс заглушки грузится НАШИМ загрузчиком ДО установки хука loadClass,
-        // чтобы не словить рекурсию при резолве этого же имени.
-        final Class<?> stub = com.zte.feature.Feature.class;
-        ClassLoader moduleCl = Hook.class.getClassLoader();
-
-        // 1) ОСНОВНОЙ способ: домержить dexElements модуля в DexPathList аппа.
+        // На стоке com.zte.feature.Feature лежит в BOOTCLASSPATH. На Lineage его
+        // нет, из-за чего ZteFeatureWrapper.<clinit> и SystemMgr.<clinit> падают
+        // в NoClassDefFoundError. Сплайсить dexElements нашего модуля в апп
+        // нельзя: ART запрещает регистрировать один DexFile в двух загрузчиках
+        // (InternalError: register dex file with multiple class loaders).
+        // Поэтому грузим ОТДЕЛЬНЫЙ stub-dex (только Feature) в новый
+        // InMemoryDexClassLoader (свежий DexFile -> конфликта нет) и ставим его
+        // РОДИТЕЛЕМ загрузчика аппа: нативный резолвер типов ART обходит цепочку
+        // parent и находит класс.
         try {
-            Object appPathList = XposedHelpers.getObjectField(appCl, "pathList");
-            Object modPathList = XposedHelpers.getObjectField(moduleCl, "pathList");
-            Object appElements = XposedHelpers.getObjectField(appPathList, "dexElements");
-            Object modElements = XposedHelpers.getObjectField(modPathList, "dexElements");
-            int al = Array.getLength(appElements);
-            int ml = Array.getLength(modElements);
-            Class<?> elemType = appElements.getClass().getComponentType();
-            Object merged = Array.newInstance(elemType, al + ml);
-            // dex аппа первыми -> его собственные классы остаются в приоритете,
-            // наш модуль лишь добавляет недостающие (com.zte.feature.Feature).
-            System.arraycopy(appElements, 0, merged, 0, al);
-            System.arraycopy(modElements, 0, merged, al, ml);
-            XposedHelpers.setObjectField(appPathList, "dexElements", merged);
-            XposedBridge.log(TAG + "injectFeatureStub: dexElements аппа=" + al
-                    + " + модуль=" + ml + " домержено");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "injectFeatureStub dex-merge failed: " + t);
-        }
+            // Уже резолвится? (на случай повторного захода)
+            try {
+                appCl.loadClass("com.zte.feature.Feature");
+                XposedBridge.log(TAG + "injectFeatureStub: Feature уже виден, пропускаю");
+                return;
+            } catch (ClassNotFoundException ignored) {
+                // ожидаемо: класса нет, продолжаем внедрение
+            }
 
-        // 2) СТРАХОВКА: если ART для нестандартной цепочки дернёт Java loadClass —
-        //    отдаём заглушку напрямую по точному имени.
-        try {
-            final String target = "com.zte.feature.Feature";
-            XposedBridge.hookAllMethods(ClassLoader.class, "loadClass", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (param.args != null && param.args.length >= 1
-                            && target.equals(param.args[0])) {
-                        param.setResult(stub);
-                    }
-                }
-            });
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "injectFeatureStub loadClass-hook failed: " + t);
-        }
+            // 1) читаем stub-dex из ресурсов нашего модуля
+            java.io.InputStream is = Hook.class.getClassLoader()
+                    .getResourceAsStream("feature_stub.dex");
+            if (is == null) {
+                XposedBridge.log(TAG + "injectFeatureStub: feature_stub.dex НЕ найден в ресурсах модуля");
+                return;
+            }
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            is.close();
+            byte[] dexBytes = bos.toByteArray();
 
-        // 3) Проверка: класс теперь должен резолвиться загрузчиком аппа.
-        try {
-            XposedHelpers.findClass("com.zte.feature.Feature", appCl);
-            XposedBridge.log(TAG + "injectFeatureStub: com.zte.feature.Feature OK (резолвится в аппе)");
+            // 2) новый загрузчик с этим dex, его родитель = текущий родитель аппа
+            ClassLoader origParent = appCl.getParent();
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(dexBytes);
+            ClassLoader stubLoader =
+                    new dalvik.system.InMemoryDexClassLoader(bb, origParent);
+            Class<?> inStub = stubLoader.loadClass("com.zte.feature.Feature");
+            XposedBridge.log(TAG + "injectFeatureStub: stub-dex загружен ("
+                    + dexBytes.length + " байт), Feature=" + inStub);
+
+            // 3) вставляем stubLoader как родителя загрузчика аппа
+            XposedHelpers.setObjectField(appCl, "parent", stubLoader);
+
+            // 4) проверка: теперь резолвится загрузчиком аппа через parent
+            Class<?> v = appCl.loadClass("com.zte.feature.Feature");
+            XposedBridge.log(TAG + "injectFeatureStub: OK, Feature виден аппом через parent: " + v);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "injectFeatureStub verify FAILED, Feature всё ещё не виден: " + t);
+            XposedBridge.log(TAG + "injectFeatureStub ошибка: " + t);
         }
     }
 
