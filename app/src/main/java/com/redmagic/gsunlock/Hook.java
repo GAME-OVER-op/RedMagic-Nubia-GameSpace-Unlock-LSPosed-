@@ -48,6 +48,12 @@ public class Hook implements IXposedHookLoadPackage {
                 // до IPC в WindowManagerService. Тип окна 2038 (TYPE_APPLICATION_OVERLAY)
                 // + appop SYSTEM_ALERT_WINDOW этого права не требуют.
                 stripTrustedOverlay(lpparam.classLoader);
+                // PowerPanelDetailsView.initView -> InputChannelWrapper.registerInputMonitor
+                // -> InputChannelCompat.initInputMonitor -> InputManager.myInput(String,Context)
+                // (приватный метод ZTE-фреймворка, отсутствует на Android 16) -> NoSuchMethodError.
+                // Глушим регистрацию input-monitor: карточка отрисуется, теряется лишь
+                // свайп-вне-окна для закрытия (не критично).
+                neutralizeInputMonitor(lpparam.classLoader);
                 break;
             case "cn.nubia.gameassist":
                 forceBooleanTrue(lpparam.classLoader,
@@ -131,6 +137,23 @@ public class Hook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "addView hook установлен (cn.zte.gamefloat), hooks=" + n);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "stripTrustedOverlay failed: " + t);
+        }
+    }
+
+    /**
+     * Делает cn.zte.gamefloat.system.InputChannelWrapper.registerInputMonitor(...) no-op.
+     * Оригинал зовёт приватный ZTE-метод InputManager.myInput(String,Context), которого
+     * нет на стоковом Android 16 -> NoSuchMethodError рушит PowerPanelDetailsView.
+     */
+    private void neutralizeInputMonitor(ClassLoader cl) {
+        try {
+            Class<?> wrapper = XposedHelpers.findClass(
+                    "cn.zte.gamefloat.system.InputChannelWrapper", cl);
+            int n = XposedBridge.hookAllMethods(wrapper, "registerInputMonitor",
+                    XC_MethodReplacement.returnConstant(null)).size();
+            XposedBridge.log(TAG + "registerInputMonitor нейтрализован (cn.zte.gamefloat), hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "neutralizeInputMonitor failed: " + t);
         }
     }
 }
