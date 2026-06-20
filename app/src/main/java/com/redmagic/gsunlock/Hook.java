@@ -26,6 +26,10 @@ public class Hook implements IXposedHookLoadPackage {
 
     // android.view.WindowManager.LayoutParams.PRIVATE_FLAG_TRUSTED_OVERLAY (@hide)
     private static final int PRIVATE_FLAG_TRUSTED_OVERLAY = 0x20000000;
+    // android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+    private static final int TYPE_APPLICATION_OVERLAY = 2038;
+    // RECEIVER_EXPORTED (Android 13+) чтобы принимать adb am broadcast из другого uid
+    private static final int RECEIVER_EXPORTED = 0x2;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -63,6 +67,25 @@ public class Hook implements IXposedHookLoadPackage {
                                 "isRedMagic",
                                 "isSupport"
                         });
+                // КОРЕНЬ текущего краша: GameAssistApplication.onCreate -> loadComponent ->
+                // Router.registerComponent("projection",ctx) -> ProjectionComApplication.onCreate ->
+                // ZteFeatureWrapper.<clinit> дергает com.zte.feature.Feature (класс ZTE-фреймворка,
+                // отсутствует на кастоме) -> NoClassDefFoundError рушит весь процесс.
+                // Оборачиваем static Router.registerComponent в try/catch: компонент, которому
+                // не хватает ZTE-классов, просто пропускается, а остальные (в т.ч. сам борд) грузятся.
+                swallowExceptions(lpparam.classLoader,
+                        "cn.nubia.componentcenter.router.Router", "registerComponent");
+                // Окно борда создаётся с type=2027 (системное, >2000 -> нужен INTERNAL_SYSTEM_WINDOW,
+                // которого у непlatform-аппа нет -> BadTokenException). Перед addView в процессе аппа
+                // переписываем тип в 2038 (TYPE_APPLICATION_OVERLAY) и снимаем trusted-overlay.
+                forceApplicationOverlay(lpparam.classLoader);
+                // FullScreenInputMonitor.registerInputEventListener/pilferPointers требуют MONITOR_INPUT
+                // (signature-only, не выдаётся непlatform-аппу) -> глушим: свайп-триггер не нужен,
+                // борд показываем своим broadcast'ом.
+                neutralizeGameAssistInput(lpparam.classLoader);
+                // Внешний триггер показа/скрытия борда без свайпа:
+                // adb shell am broadcast -a com.redmagic.gsunlock.SHOW_PANEL
+                installPanelTrigger(lpparam.classLoader);
                 break;
             case "cn.nubia.gamelauncher":
                 // тот же WindowManagerWrapper и здесь — большая панель (GameControlDialog/
@@ -154,6 +177,150 @@ public class Hook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "registerInputMonitor нейтрализован (cn.zte.gamefloat), hooks=" + n);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "neutralizeInputMonitor failed: " + t);
+        }
+    }
+
+    /**
+     * Оборачивает все перегрузки className.methodName в try/catch: оригинал вызывается,
+     * но любое выброшенное Throwable проглатывается (метод возвращает null/void).
+     * Используется чтобы падение одного компонента в Router.registerComponent не убивало
+     * весь процесс GameAssist (на кастоме нет части ZTE-фреймворк-классов).
+     */
+    private void swallowExceptions(ClassLoader cl, final String className, final String methodName) {
+        try {
+            Class<?> c = XposedHelpers.findClass(className, cl);
+            int n = XposedBridge.hookAllMethods(c, methodName, new XC_MethodReplacement() {
+                @Override
+                protected Object replaceHookedMethod(MethodHookParam p) {
+                    try {
+                        return XposedBridge.invokeOriginalMethod(p.method, p.thisObject, p.args);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "swallowed " + className + "." + methodName
+                                + ": " + t.getCause() + " / " + t);
+                        return null;
+                    }
+                }
+            }).size();
+            XposedBridge.log(TAG + "swallowExceptions wrap " + className + "." + methodName
+                    + " hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "swallowExceptions find fail " + className + ": " + t);
+        }
+    }
+
+    /**
+     * Перед WindowManagerImpl.addView переписывает системный тип окна (2000..2999, кроме 2038)
+     * в 2038 (TYPE_APPLICATION_OVERLAY) и снимает PRIVATE_FLAG_TRUSTED_OVERLAY.
+     * Так борд GameAssist (исходно type=2027) добавляется как обычный overlay-аппа без
+     * INTERNAL_SYSTEM_WINDOW. Нужен лишь appop SYSTEM_ALERT_WINDOW.
+     */
+    private void forceApplicationOverlay(ClassLoader cl) {
+        try {
+            Class<?> wmImpl = XposedHelpers.findClass("android.view.WindowManagerImpl", cl);
+            int n = XposedBridge.hookAllMethods(wmImpl, "addView", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null) return;
+                    for (Object a : param.args) {
+                        if (a instanceof android.view.WindowManager.LayoutParams) {
+                            android.view.WindowManager.LayoutParams lp =
+                                    (android.view.WindowManager.LayoutParams) a;
+                            try {
+                                if (lp.type >= 2000 && lp.type <= 2999
+                                        && lp.type != TYPE_APPLICATION_OVERLAY) {
+                                    XposedBridge.log(TAG + "window type " + lp.type + " -> 2038");
+                                    lp.type = TYPE_APPLICATION_OVERLAY;
+                                }
+                                int pf = XposedHelpers.getIntField(lp, "privateFlags");
+                                if ((pf & PRIVATE_FLAG_TRUSTED_OVERLAY) != 0) {
+                                    pf &= ~PRIVATE_FLAG_TRUSTED_OVERLAY;
+                                    XposedHelpers.setIntField(lp, "privateFlags", pf);
+                                    XposedBridge.log(TAG + "stripped TRUSTED_OVERLAY (gameassist)");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "overlay fix fail: " + t);
+                            }
+                        }
+                    }
+                }
+            }).size();
+            XposedBridge.log(TAG + "forceApplicationOverlay addView hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "forceApplicationOverlay failed: " + t);
+        }
+    }
+
+    /**
+     * Глушит cn.nubia.gameassist.input.FullScreenInputMonitor.registerInputEventListener /
+     * pilferPointers — оба требуют android.permission.MONITOR_INPUT (signature-only),
+     * которого у непlatform-аппа нет. Свайп-открытие борда теряется (его заменяет broadcast),
+     * сам борд при этом строится и показывается нормально.
+     */
+    private void neutralizeGameAssistInput(ClassLoader cl) {
+        try {
+            Class<?> c = XposedHelpers.findClass(
+                    "cn.nubia.gameassist.input.FullScreenInputMonitor", cl);
+            int n = 0;
+            n += XposedBridge.hookAllMethods(c, "registerInputEventListener",
+                    XC_MethodReplacement.returnConstant(null)).size();
+            n += XposedBridge.hookAllMethods(c, "pilferPointers",
+                    XC_MethodReplacement.returnConstant(null)).size();
+            XposedBridge.log(TAG + "FullScreenInputMonitor нейтрализован, hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "neutralizeGameAssistInput failed: " + t);
+        }
+    }
+
+    /**
+     * После GameAssistApplication.onCreate регистрирует receiver на
+     *   com.redmagic.gsunlock.SHOW_PANEL / HIDE_PANEL
+     * и зовёт GameAssistWindowManager.getInstance(ctx).showWindow("hook") / hideWindow("hook").
+     * Это даёт ручной показ борда без свайпа:
+     *   adb shell am broadcast -a com.redmagic.gsunlock.SHOW_PANEL
+     */
+    private void installPanelTrigger(ClassLoader cl) {
+        try {
+            Class<?> appClass = XposedHelpers.findClass(
+                    "cn.nubia.gameassist.GameAssistApplication", cl);
+            XposedBridge.hookAllMethods(appClass, "onCreate", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        final android.content.Context ctx =
+                                (android.content.Context) param.thisObject;
+                        android.content.BroadcastReceiver r = new android.content.BroadcastReceiver() {
+                            @Override
+                            public void onReceive(android.content.Context c, android.content.Intent i) {
+                                try {
+                                    Class<?> wm = XposedHelpers.findClass(
+                                            "cn.nubia.gameassist.panel.GameAssistWindowManager",
+                                            ctx.getClassLoader());
+                                    Object inst = XposedHelpers.callStaticMethod(wm, "getInstance", ctx);
+                                    String act = i.getAction();
+                                    if (act != null && act.endsWith("HIDE_PANEL")) {
+                                        XposedHelpers.callMethod(inst, "hideWindow", "hook");
+                                    } else {
+                                        XposedHelpers.callMethod(inst, "showWindow", "hook");
+                                    }
+                                    XposedBridge.log(TAG + "panel trigger fired: " + act);
+                                } catch (Throwable t) {
+                                    XposedBridge.log(TAG + "panel trigger invoke fail: " + t);
+                                }
+                            }
+                        };
+                        android.content.IntentFilter f = new android.content.IntentFilter();
+                        f.addAction("com.redmagic.gsunlock.SHOW_PANEL");
+                        f.addAction("com.redmagic.gsunlock.HIDE_PANEL");
+                        ctx.registerReceiver(r, f, RECEIVER_EXPORTED);
+                        XposedBridge.log(TAG + "panel trigger receiver registered");
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "installPanelTrigger register fail: " + t);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + "installPanelTrigger hooked GameAssistApplication.onCreate");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "installPanelTrigger failed: " + t);
         }
     }
 }
