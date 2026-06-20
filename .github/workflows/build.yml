@@ -26,6 +26,14 @@ jobs:
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.7
 
+      - name: Build Feature stub dex
+        run: |
+          mkdir -p /tmp/stubcls /tmp/stubout app/src/main/assets
+          javac -d /tmp/stubcls app/src/main/java/com/zte/feature/Feature.java
+          "$ANDROID_HOME/build-tools/34.0.0/d8" --min-api 28 --output /tmp/stubout /tmp/stubcls/com/zte/feature/Feature.class
+          cp /tmp/stubout/classes.dex app/src/main/assets/feature_stub.dex
+          ls -l app/src/main/assets/
+
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 

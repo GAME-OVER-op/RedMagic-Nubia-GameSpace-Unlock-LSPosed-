@@ -316,21 +316,13 @@ public class Hook implements IXposedHookLoadPackage {
                 // ожидаемо: класса нет, продолжаем внедрение
             }
 
-            // 1) читаем stub-dex из ресурсов нашего модуля
-            java.io.InputStream is = Hook.class.getClassLoader()
-                    .getResourceAsStream("feature_stub.dex");
-            if (is == null) {
-                XposedBridge.log(TAG + "injectFeatureStub: feature_stub.dex НЕ найден в ресурсах модуля");
+            // 1) читаем stub-dex (несколько источников: assets через
+            //    classloader, корень ресурсов и напрямую из base.apk модуля)
+            byte[] dexBytes = readStubDex();
+            if (dexBytes == null) {
+                XposedBridge.log(TAG + "injectFeatureStub: feature_stub.dex не найден ни в одном источнике");
                 return;
             }
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = is.read(buf)) > 0) {
-                bos.write(buf, 0, n);
-            }
-            is.close();
-            byte[] dexBytes = bos.toByteArray();
 
             // 2) новый загрузчик с этим dex, его родитель = текущий родитель аппа
             ClassLoader origParent = appCl.getParent();
@@ -350,6 +342,85 @@ public class Hook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + "injectFeatureStub ошибка: " + t);
         }
+    }
+
+    // Читает байты feature_stub.dex. Сначала пробуем ресурсы модуля
+    // (assets/ и корень), затем — напрямую base.apk модуля как zip-запись.
+    private byte[] readStubDex() {
+        String[] names = { "assets/feature_stub.dex", "feature_stub.dex", "/assets/feature_stub.dex" };
+        ClassLoader mcl = Hook.class.getClassLoader();
+        for (String name : names) {
+            try {
+                java.io.InputStream is = mcl.getResourceAsStream(name);
+                if (is != null) {
+                    byte[] b = drain(is);
+                    is.close();
+                    if (b != null && b.length > 0) {
+                        XposedBridge.log(TAG + "readStubDex: из ресурса " + name + " (" + b.length + " байт)");
+                        return b;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            String apk = moduleApkPath();
+            if (apk != null) {
+                java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apk);
+                try {
+                    java.util.zip.ZipEntry e = zf.getEntry("assets/feature_stub.dex");
+                    if (e != null) {
+                        byte[] b = drain(zf.getInputStream(e));
+                        if (b != null && b.length > 0) {
+                            XposedBridge.log(TAG + "readStubDex: из apk " + apk + " (" + b.length + " байт)");
+                            return b;
+                        }
+                    }
+                } finally {
+                    zf.close();
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "readStubDex apk ошибка: " + t);
+        }
+        return null;
+    }
+
+    private byte[] drain(java.io.InputStream is) throws java.io.IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) > 0) {
+            bos.write(buf, 0, n);
+        }
+        return bos.toByteArray();
+    }
+
+    // Путь к base.apk модуля. CodeSource на Android обычно null, поэтому
+    // основной способ — распарсить toString загрузчика модуля.
+    private String moduleApkPath() {
+        try {
+            java.security.CodeSource cs = Hook.class.getProtectionDomain().getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                String p = cs.getLocation().getPath();
+                if (p != null && p.contains(".apk")) {
+                    return p;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            String s = String.valueOf(Hook.class.getClassLoader());
+            int i = s.indexOf("/data/app/");
+            if (i >= 0) {
+                int j = s.indexOf(".apk", i);
+                if (j >= 0) {
+                    return s.substring(i, j + 4);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private void installPanelTrigger(ClassLoader cl) {
