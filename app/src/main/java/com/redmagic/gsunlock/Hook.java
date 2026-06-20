@@ -3,6 +3,7 @@ package com.redmagic.gsunlock;
 import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
@@ -23,6 +24,9 @@ public class Hook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[GSUnlock] ";
 
+    // android.view.WindowManager.LayoutParams.PRIVATE_FLAG_TRUSTED_OVERLAY (@hide)
+    private static final int PRIVATE_FLAG_TRUSTED_OVERLAY = 0x20000000;
+
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
         switch (lpparam.packageName) {
@@ -35,6 +39,15 @@ public class Hook implements IXposedHookLoadPackage {
                                 "isRunOnMyOs",
                                 "isMyOs"
                         });
+                // КОРЕНЬ краша боковых панелей: WindowManagerWrapper ставит на окно
+                // privateFlags |= PRIVATE_FLAG_TRUSTED_OVERLAY (0x20000000). Добавление
+                // trusted-overlay требует android.permission.INTERNAL_SYSTEM_WINDOW
+                // (signature|recents|module), которого у uid аппа нет на Lineage ->
+                // SecurityException в DisplayPolicy.validateAddingWindowLw -> addView падает.
+                // Снимаем этот бит у ЛЮБОГО окна прямо перед addView, в процессе аппа,
+                // до IPC в WindowManagerService. Тип окна 2038 (TYPE_APPLICATION_OVERLAY)
+                // + appop SYSTEM_ALERT_WINDOW этого права не требуют.
+                stripTrustedOverlay(lpparam.classLoader);
                 break;
             case "cn.nubia.gameassist":
                 forceBooleanTrue(lpparam.classLoader,
@@ -79,6 +92,40 @@ public class Hook implements IXposedHookLoadPackage {
         if (hooked == 0) {
             XposedBridge.log(TAG + "WARNING: no methods hooked in " + className
                     + " — проверь имена методов");
+        }
+    }
+
+    /**
+     * Снимает PRIVATE_FLAG_TRUSTED_OVERLAY со всех окон, добавляемых аппом.
+     * Хукаем все перегрузки WindowManagerImpl.addView(...) и чистим privateFlags
+     * у любого аргумента типа WindowManager.LayoutParams перед вызовом оригинала.
+     */
+    private void stripTrustedOverlay(ClassLoader cl) {
+        try {
+            Class<?> wmImpl = XposedHelpers.findClass("android.view.WindowManagerImpl", cl);
+            int n = XposedBridge.hookAllMethods(wmImpl, "addView", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null) return;
+                    for (Object a : param.args) {
+                        if (a instanceof android.view.WindowManager.LayoutParams) {
+                            try {
+                                int pf = XposedHelpers.getIntField(a, "privateFlags");
+                                if ((pf & PRIVATE_FLAG_TRUSTED_OVERLAY) != 0) {
+                                    pf &= ~PRIVATE_FLAG_TRUSTED_OVERLAY;
+                                    XposedHelpers.setIntField(a, "privateFlags", pf);
+                                    XposedBridge.log(TAG + "stripped TRUSTED_OVERLAY before addView");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "strip fail: " + t);
+                            }
+                        }
+                    }
+                }
+            }).size();
+            XposedBridge.log(TAG + "addView hook установлен (cn.zte.gamefloat), hooks=" + n);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "stripTrustedOverlay failed: " + t);
         }
     }
 }
