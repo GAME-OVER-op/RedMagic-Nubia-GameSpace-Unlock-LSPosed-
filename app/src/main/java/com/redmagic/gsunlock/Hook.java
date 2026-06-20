@@ -58,6 +58,11 @@ public class Hook implements IXposedHookLoadPackage {
                                 "isSupport"
                         });
                 break;
+            case "cn.nubia.gamelauncher":
+                // тот же WindowManagerWrapper и здесь — большая панель (GameControlDialog/
+                // PowerPanel/Strengthen-вью) тоже ставит trusted-overlay -> снимаем так же.
+                stripTrustedOverlay(lpparam.classLoader);
+                break;
             default:
                 break;
         }
