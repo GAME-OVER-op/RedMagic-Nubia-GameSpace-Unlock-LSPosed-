@@ -1,5 +1,6 @@
 package com.redmagic.gsunlock;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -60,6 +61,12 @@ public class Hook implements IXposedHookLoadPackage {
                 neutralizeInputMonitor(lpparam.classLoader);
                 break;
             case "cn.nubia.gameassist":
+                // САМОЕ ПЕРВОЕ: подсунуть отсутствующий на кастоме класс
+                // com.zte.feature.Feature (заглушку из нашего модуля) в класслоадер
+                // аппа. Без него ZteFeatureWrapper.<clinit> -> SystemMgr.<clinit> ->
+                // весь борд падают с NoClassDefFoundError (краш в onCreate стр.101
+                // уже ПОСЛЕ swallowExceptions). Должно стоять до загрузки классов аппа.
+                injectFeatureStub(lpparam.classLoader);
                 forceBooleanTrue(lpparam.classLoader,
                         "com.zte.gameassist.config.ZteFeature",
                         new String[]{
@@ -278,6 +285,71 @@ public class Hook implements IXposedHookLoadPackage {
      * Это даёт ручной показ борда без свайпа:
      *   adb shell am broadcast -a com.redmagic.gsunlock.SHOW_PANEL
      */
+    /**
+     * На кастомной прошивке нет класса com.zte.feature.Feature (ZTE framework,
+     * обычно в BOOTCLASSPATH). Его статически дергают ZteFeatureWrapper.<clinit>,
+     * DisplayManagerWrapper и Constants. Отсутствие -> NoClassDefFoundError при
+     * инициализации классов отравляет ZteFeatureWrapper -> SystemMgr -> весь борд.
+     *
+     * Лечим причину: добавляем dex нашего модуля (в нём лежит заглушка
+     * com.zte.feature.Feature) в DexPathList класслоадера приложения. Тогда
+     * нативный резолвер ART находит класс, и вся цепочка инициализируется со
+     * значениями по умолчанию (ZTE_FEATURE_MAGIC_GAME_ASSIST=true -> ENABLE_GAME_ASSIST
+     * включён, остальные RM-фичи выкл). Доп. страховка — хук ClassLoader.loadClass.
+     */
+    private void injectFeatureStub(ClassLoader appCl) {
+        // Класс заглушки грузится НАШИМ загрузчиком ДО установки хука loadClass,
+        // чтобы не словить рекурсию при резолве этого же имени.
+        final Class<?> stub = com.zte.feature.Feature.class;
+        ClassLoader moduleCl = Hook.class.getClassLoader();
+
+        // 1) ОСНОВНОЙ способ: домержить dexElements модуля в DexPathList аппа.
+        try {
+            Object appPathList = XposedHelpers.getObjectField(appCl, "pathList");
+            Object modPathList = XposedHelpers.getObjectField(moduleCl, "pathList");
+            Object appElements = XposedHelpers.getObjectField(appPathList, "dexElements");
+            Object modElements = XposedHelpers.getObjectField(modPathList, "dexElements");
+            int al = Array.getLength(appElements);
+            int ml = Array.getLength(modElements);
+            Class<?> elemType = appElements.getClass().getComponentType();
+            Object merged = Array.newInstance(elemType, al + ml);
+            // dex аппа первыми -> его собственные классы остаются в приоритете,
+            // наш модуль лишь добавляет недостающие (com.zte.feature.Feature).
+            System.arraycopy(appElements, 0, merged, 0, al);
+            System.arraycopy(modElements, 0, merged, al, ml);
+            XposedHelpers.setObjectField(appPathList, "dexElements", merged);
+            XposedBridge.log(TAG + "injectFeatureStub: dexElements аппа=" + al
+                    + " + модуль=" + ml + " домержено");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "injectFeatureStub dex-merge failed: " + t);
+        }
+
+        // 2) СТРАХОВКА: если ART для нестандартной цепочки дернёт Java loadClass —
+        //    отдаём заглушку напрямую по точному имени.
+        try {
+            final String target = "com.zte.feature.Feature";
+            XposedBridge.hookAllMethods(ClassLoader.class, "loadClass", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args != null && param.args.length >= 1
+                            && target.equals(param.args[0])) {
+                        param.setResult(stub);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "injectFeatureStub loadClass-hook failed: " + t);
+        }
+
+        // 3) Проверка: класс теперь должен резолвиться загрузчиком аппа.
+        try {
+            XposedHelpers.findClass("com.zte.feature.Feature", appCl);
+            XposedBridge.log(TAG + "injectFeatureStub: com.zte.feature.Feature OK (резолвится в аппе)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "injectFeatureStub verify FAILED, Feature всё ещё не виден: " + t);
+        }
+    }
+
     private void installPanelTrigger(ClassLoader cl) {
         try {
             Class<?> appClass = XposedHelpers.findClass(
