@@ -33,6 +33,18 @@ public class Hook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
+        // Универсально: на кастоме у ВСЕХ nubia/zte-процессов отсутствует
+        // com.zte.feature.Feature (он в BOOTCLASSPATH стока). Любое обращение к
+        // ZteFeatureWrapper.<clinit> рушит процесс — например cn.nubia.virtualgamehandle
+        // падает ещё в GameHandleProvider/ContentProvider.onCreate, ДО Application.onCreate.
+        // handleLoadPackage вызывается раньше всего этого, поэтому подсовываем заглушку
+        // Feature в класслоадер любого такого процесса заранее. injectFeatureStub
+        // идемпотентен (проверяет, виден ли уже Feature, и пропускает).
+        String pkg = lpparam.packageName;
+        if (pkg != null && (pkg.startsWith("cn.nubia") || pkg.startsWith("cn.zte")
+                || pkg.startsWith("com.zte") || pkg.startsWith("com.nubia"))) {
+            injectFeatureStub(lpparam.classLoader);
+        }
         switch (lpparam.packageName) {
             case "cn.zte.gamefloat":
                 forceBooleanTrue(lpparam.classLoader,
